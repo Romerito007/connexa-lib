@@ -114,9 +114,10 @@ func (cli *Client) sendIQAsyncAndGetData(query *infoQuery) (<-chan *waBinary.Nod
 	}
 	waiter := cli.waitResponse(query.ID)
 	attrs := waBinary.Attrs{
-		"id":    query.ID,
-		"xmlns": query.Namespace,
-		"type":  string(query.Type),
+		"id":      query.ID,
+		"xmlns":   DefaultConfig.Namespaces[query.Namespace],
+		"type":    string(query.Type),
+		"version": "2",
 	}
 	if !query.To.IsEmpty() {
 		attrs["to"] = query.To
@@ -185,41 +186,47 @@ func (cli *Client) retryFrame(reqType, id string, data []byte, origResp *waBinar
 		return nil, &DisconnectedError{Action: reqType, Node: origResp}
 	}
 
-	cli.Log.Debugf("%s (%s) was interrupted by websocket disconnection (%s), waiting for reconnect to retry...", id, reqType, origResp.XMLString())
-	if !cli.WaitForConnection(5 * time.Second) {
-		cli.Log.Debugf("Websocket didn't reconnect within 5 seconds of failed %s (%s)", reqType, id)
-		return nil, &DisconnectedError{Action: reqType, Node: origResp}
-	}
+	const maxRetries = 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		cli.Log.Debugf("Retrying %s (%s), attempt %d/%d", reqType, id, attempt, maxRetries)
+		if !cli.WaitForConnection(5 * time.Second) {
+			cli.Log.Debugf("Websocket didn't reconnect within 5 seconds of failed %s (%s)", reqType, id)
+			return nil, &DisconnectedError{Action: reqType, Node: origResp}
+		}
 
-	cli.socketLock.RLock()
-	sock := cli.socket
-	cli.socketLock.RUnlock()
-	if sock == nil {
-		return nil, ErrNotConnected
-	}
+		cli.socketLock.RLock()
+		sock := cli.socket
+		cli.socketLock.RUnlock()
+		if sock == nil {
+			return nil, ErrNotConnected
+		}
 
-	respChan := cli.waitResponse(id)
-	err := sock.SendFrame(data)
-	if err != nil {
-		cli.cancelResponse(id, respChan)
-		return nil, err
+		respChan := cli.waitResponse(id)
+		time.Sleep(time.Duration(1<<attempt) * time.Second) // Backoff exponencial
+		err := sock.SendFrame(data)
+		if err != nil {
+			cli.cancelResponse(id, respChan)
+			return nil, err
+		}
+
+		var resp *waBinary.Node
+		timeoutChan := make(<-chan time.Time, 1)
+		if timeout > 0 {
+			timeoutChan = time.After(timeout)
+		}
+		select {
+		case resp = <-respChan:
+			if isDisconnectNode(resp) {
+				cli.Log.Debugf("Retrying %s (%s) was interrupted by websocket disconnection (%v)", reqType, id, resp.XMLString())
+				continue
+			}
+			return resp, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeoutChan:
+			return nil, ErrIQTimedOut
+		}
 	}
-	var resp *waBinary.Node
-	timeoutChan := make(<-chan time.Time, 1)
-	if timeout > 0 {
-		timeoutChan = time.After(timeout)
-	}
-	select {
-	case resp = <-respChan:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-timeoutChan:
-		// FIXME this error isn't technically correct (but works for now - the timeout param is only used from sendIQ)
-		return nil, ErrIQTimedOut
-	}
-	if isDisconnectNode(resp) {
-		cli.Log.Debugf("Retrying %s %s was interrupted by websocket disconnection (%v), not retrying anymore", reqType, id, resp.XMLString())
-		return nil, &DisconnectedError{Action: fmt.Sprintf("%s (retry)", reqType), Node: resp}
-	}
-	return resp, nil
+	cli.Log.Debugf("Max retry attempts (%d) exceeded for %s (%s)", maxRetries, reqType, id)
+	return nil, &DisconnectedError{Action: fmt.Sprintf("%s (retry)", reqType), Node: origResp}
 }

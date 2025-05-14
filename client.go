@@ -25,6 +25,7 @@ import (
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -50,6 +51,23 @@ type wrappedEventHandler struct {
 type deviceCache struct {
 	devices []types.JID
 	dhash   string
+}
+
+// Config define configurações globais da biblioteca
+type Config struct {
+	Namespaces map[string]string
+}
+
+// DefaultConfig contém configurações padrão
+var DefaultConfig = Config{
+	Namespaces: map[string]string{
+		"privacy": "privacy",
+		"push":    "urn:xmpp:whatsapp:push",
+		"usync":   "usync",
+		"w:qr":    "w:qr",
+		"w:biz":   "w:biz",
+		"md":      "md",
+	},
 }
 
 // Client contains everything necessary to connect to and interact with the WhatsApp web API.
@@ -452,24 +470,53 @@ func (cli *Client) Connect() error {
 	fs := socket.NewFrameSocket(cli.Log.Sub("Socket"), wsDialer)
 	if cli.MessengerConfig != nil {
 		fs.URL = cli.MessengerConfig.WebsocketURL
-		fs.HTTPHeaders.Set("Origin", cli.MessengerConfig.BaseURL)
-		fs.HTTPHeaders.Set("User-Agent", cli.MessengerConfig.UserAgent)
-		fs.HTTPHeaders.Set("Cache-Control", "no-cache")
-		fs.HTTPHeaders.Set("Pragma", "no-cache")
-		//fs.HTTPHeaders.Set("Sec-Fetch-Dest", "empty")
-		//fs.HTTPHeaders.Set("Sec-Fetch-Mode", "websocket")
-		//fs.HTTPHeaders.Set("Sec-Fetch-Site", "cross-site")
+		fs.HTTPHeaders = getDynamicHeaders(store.DeviceProps, store.BaseClientPayload.UserAgent)
+	} else {
+		fs.HTTPHeaders = getDynamicHeaders(store.DeviceProps, store.BaseClientPayload.UserAgent)
 	}
 	if err := fs.Connect(); err != nil {
 		fs.Close(0)
 		return err
-	} else if err = cli.doHandshake(fs, *keys.NewKeyPair()); err != nil {
+	}
+	cli.socket = &socket.NoiseSocket{}
+	if err := cli.doHandshake(fs, *keys.NewKeyPair()); err != nil {
 		fs.Close(0)
 		return fmt.Errorf("noise handshake failed: %w", err)
 	}
 	go cli.keepAliveLoop(cli.socket.Context())
 	go cli.handlerQueueLoop(cli.socket.Context())
 	return nil
+}
+
+// getDynamicHeaders gera cabeçalhos HTTP baseados em SetOSInfo e User-Agent
+func getDynamicHeaders(props *waCompanionReg.DeviceProps, userAgent *waWa6.ClientPayload_UserAgent) http.Header {
+	headers := http.Header{
+		"Origin":          []string{socket.Origin},
+		"Referer":         []string{socket.Origin + "/"},
+		"Sec-Fetch-Dest":  []string{"document"},
+		"Sec-Fetch-Mode":  []string{"navigate"},
+		"Sec-Fetch-Site":  []string{"none"},
+		"Sec-Fetch-User":  []string{"?1"},
+		"Accept":          []string{"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"},
+		"Accept-Language": []string{fmt.Sprintf("%s-%s,%s;q=0.9", *userAgent.LocaleLanguageIso6391, *userAgent.LocaleCountryIso31661Alpha2, *userAgent.LocaleLanguageIso6391)},
+	}
+
+	osName := *props.Os
+	osVersion := *userAgent.OsVersion
+	chromeVersion := fmt.Sprintf("%d.%d.%d", *userAgent.AppVersion.Primary, *userAgent.AppVersion.Secondary, *userAgent.AppVersion.Tertiary)
+
+	switch osName {
+	case "Linux":
+		headers.Set("User-Agent", fmt.Sprintf("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", chromeVersion))
+	case "Windows 10", "Windows 11":
+		headers.Set("User-Agent", fmt.Sprintf("Mozilla/5.0 (Windows NT %s; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", osVersion, chromeVersion))
+	case "macOS":
+		headers.Set("User-Agent", fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X %s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", osVersion, chromeVersion))
+	default:
+		headers.Set("User-Agent", fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", chromeVersion))
+	}
+
+	return headers
 }
 
 // IsLoggedIn returns true after the client is successfully connected and authenticated on WhatsApp.
@@ -588,7 +635,7 @@ func (cli *Client) Logout() error {
 		return ErrNotLoggedIn
 	}
 	_, err := cli.sendIQ(infoQuery{
-		Namespace: "md",
+		Namespace: DefaultConfig.Namespaces["md"],
 		Type:      "set",
 		To:        types.ServerJID,
 		Content: []waBinary.Node{{

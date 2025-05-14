@@ -1,9 +1,3 @@
-// Copyright (c) 2024 Tulir Asokan
-//
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package whatsmeow
 
 import (
@@ -14,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"go.mau.fi/whatsmeow/store"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,7 +16,6 @@ import (
 
 	"go.mau.fi/util/random"
 
-	"go.mau.fi/whatsmeow/socket"
 	"go.mau.fi/whatsmeow/util/cbcutil"
 )
 
@@ -203,7 +197,6 @@ func (cli *Client) rawUpload(ctx context.Context, dataToUpload io.Reader, upload
 	uploadPrefix := "mms"
 	if cli.MessengerConfig != nil {
 		uploadPrefix = "wa-msgr/mms"
-		// Messenger upload only allows voice messages, not audio files
 		if mmsType == "audio" {
 			mmsType = "ptt"
 		}
@@ -212,13 +205,9 @@ func (cli *Client) rawUpload(ctx context.Context, dataToUpload io.Reader, upload
 		mmsType = fmt.Sprintf("newsletter-%s", mmsType)
 		uploadPrefix = "newsletter"
 	}
-	var host string
-	// Hacky hack to prefer last option (rupload.facebook.com) for messenger uploads.
-	// For some reason, the primary host doesn't work, even though it has the <upload/> tag.
+	host := mediaConn.Hosts[0].Hostname
 	if cli.MessengerConfig != nil {
 		host = mediaConn.Hosts[len(mediaConn.Hosts)-1].Hostname
-	} else {
-		host = mediaConn.Hosts[0].Hostname
 	}
 	uploadURL := url.URL{
 		Scheme:   "https",
@@ -233,19 +222,19 @@ func (cli *Client) rawUpload(ctx context.Context, dataToUpload io.Reader, upload
 	}
 
 	req.ContentLength = int64(uploadSize)
-	req.Header.Set("Origin", socket.Origin)
-	req.Header.Set("Referer", socket.Origin+"/")
+	req.Header = getDynamicHeaders(store.DeviceProps, store.BaseClientPayload.UserAgent)
 
 	httpResp, err := cli.http.Do(req)
 	if err != nil {
-		err = fmt.Errorf("failed to execute request: %w", err)
-	} else if httpResp.StatusCode != http.StatusOK {
-		err = fmt.Errorf("upload failed with status code %d", httpResp.StatusCode)
-	} else if err = json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
-		err = fmt.Errorf("failed to parse upload response: %w", err)
+		return fmt.Errorf("failed to execute request: %w", err)
 	}
-	if httpResp != nil {
-		_ = httpResp.Body.Close()
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("upload failed with status code %d", httpResp.StatusCode)
 	}
-	return err
+	if err = json.NewDecoder(httpResp.Body).Decode(resp); err != nil {
+		return fmt.Errorf("failed to parse upload response: %w", err)
+	}
+	return nil
 }
